@@ -101,9 +101,6 @@ def evaluate(model, data):
     return loss.item(), auc
 
 
-
-import numpy as np
-
 def get_top_k_recommendations(prob_matrix, train_edges, k=10):
 
     """
