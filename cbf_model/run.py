@@ -1,10 +1,22 @@
 import pickle
-import networkx as nx
 import numpy as np
-from scipy import sparse
+
+import nltk
+import string
+import re
+from nltk.corpus import stopwords
+from nltk.stem import WordNetLemmatizer
+
+from sklearn.feature_extraction.text import TfidfVectorizer
+
+from scipy.sparse import csr_matrix, issparse
+
 
 PATH_DATA = './data/clean_data.pkl'
 k_val = 50
+
+nltk.download('stopwords')
+nltk.download('wordnet')
 
 def get_top_k_recommendations(prob_matrix, train_edges, k=10):
 
@@ -31,29 +43,26 @@ def get_top_k_recommendations(prob_matrix, train_edges, k=10):
     return top_k_indices_unsorted
 
 
-def run_rwr(G, start_matrix, alpha=0.85, max_iter=50, tol=1e-6):
-    nodes = list(G.nodes())
-    n = len(nodes)
+def custom_preprocessor(text):
+    """
+    Performs text cleaning (lowercase, punctuation/digit removal), tokenization, stop word removal, and lemmatization.
+    """
 
-    A = nx.to_scipy_sparse_array(G, nodelist=nodes, weight='weight', format='csr')
+    lemmatizer = WordNetLemmatizer()
+    english_stopwords = set(stopwords.words('english'))
+    text = text.lower()
+    text = re.sub(f'[{re.escape(string.punctuation)}]', '', text) # remove punctuation
+    text = re.sub(r'\d+', '', text) # remove digits
+    tokens = text.split()
 
-    row_sums = np.array(A.sum(axis=1)).flatten()
-    row_sums[row_sums == 0] = 1.0
-    P = sparse.diags(1.0 / row_sums) @ A
+    processed_tokens = []
+    for word in tokens:
+        if word not in english_stopwords:
+            word = lemmatizer.lemmatize(word)
+            processed_tokens.append(word)
 
-    S = start_matrix.copy()
-    Restart = start_matrix.copy()
+    return ' '.join(processed_tokens)
 
-    for i in range(max_iter):
-        S_prev = S.copy()
-
-        S = alpha * P.dot(S) + (1 - alpha) * Restart
-        err = np.abs(S - S_prev).mean()
-        if err < tol:
-            print(f"Converged after {i+1} iterations.")
-            break
-
-    return S, nodes
 
 
 if __name__ == '__main__':
@@ -71,28 +80,36 @@ if __name__ == '__main__':
     
     n_customers = dataset_dictionary['n_customers']
     n_products = len(dataset_dictionary['products'])
-    ITEM_OFFSET = n_customers
 
+    cleaned_description = list(map(custom_preprocessor, dataset_dictionary['products']))
 
-    ### Instantiate a networkx graph
-    G = nx.Graph()
-    G.add_nodes_from(range(n_customers))
-    G.add_nodes_from(range(ITEM_OFFSET, ITEM_OFFSET + n_products))
-    for i in range(0, len(dataset_dictionary['train_edges'])):
-        u, v = dataset_dictionary['train_edges'][i]
-        w = dataset_dictionary['train_ratings'][i]
-        G.add_weighted_edges_from([(u, ITEM_OFFSET + v, w)])
+    tfidf = TfidfVectorizer(analyzer='word', ngram_range=(1, 2), min_df=0.002, max_df=0.9, stop_words=None)
+    X_products = tfidf.fit_transform(cleaned_description) ### (n_products, n_features)
+    if not issparse(X_products):
+        X_products = csr_matrix(X_products)
 
+    ### Sparse matrix of shape (n_users, n_products) 
+    ### that contains rating of each respective product reviewed by user
+    user_item_matrix = csr_matrix(
+        (np.array(dataset_dictionary['train_ratings']), np.array(dataset_dictionary['train_edges']).T),
+        shape=(n_customers, n_products)
+    )
 
-    ### Every Customer is identified as an initial starting point for Random Walk
-    mat1 = np.eye(n_customers)
-    mat2 = np.zeros((n_products, n_customers))
+    X_users = user_item_matrix.dot(X_products)
+    user_total_weights = user_item_matrix.sum(axis=1)
+    user_total_weights[user_total_weights == 0] = 1e-9
+    user_total_weights_dense = user_total_weights.A
+    X_users = X_users.multiply(1 / user_total_weights_dense) ### Taking weighted average of each product rated
+    X_users = csr_matrix(X_users)
 
-    initial_matrix = np.concatenate((mat1, mat2), axis=0)
+    if issparse(X_products):
+        X_products_T = X_products.transpose().tocsr()
+    else:
+        X_products_T = X_products.T
 
-    final_matrix, _ = run_rwr(G, initial_matrix)
+    R_scores = X_users.dot(X_products_T)
 
-    similarity_matrix = final_matrix.T[:, 2100:]
+    similarity_matrix = R_scores.toarray()
 
     train_edges = np.array(dataset_dictionary['train_edges']).T
     model_recommendations = get_top_k_recommendations(similarity_matrix, train_edges, k=k_val)
@@ -101,7 +118,7 @@ if __name__ == '__main__':
     test_set = [set() for _ in range(n_customers)]
     for user_idx, product_idx in dataset_dictionary['test_edges']:
         test_set[user_idx].add(product_idx)
-    
+
     recommendation_set = [set(model_recommendations[i].flat) for i in range(n_customers)]
 
     total_count = 0
@@ -116,6 +133,3 @@ if __name__ == '__main__':
         total_count += 1
 
     print('Recall@K:', total_recall / total_count, 'For K =', k_val)
-
-    
-
